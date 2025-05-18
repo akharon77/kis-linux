@@ -1,0 +1,404 @@
+From 670eeede7f732476ca1b577f0f4e3ffa1d850b0c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=D0=A2=D0=B8=D0=BC=D1=83=D1=80=20=D0=90=D0=B1=D0=B4=D1=83?=
+ =?UTF-8?q?=D0=BB=D0=BB=D0=B8=D0=BD?= <abdullin.ta@phystech.su>
+Date: Sun, 18 May 2025 18:58:13 +0300
+Subject: [PATCH] Task 1:  add phonebook module
+
+---
+ arch/x86/entry/syscalls/syscall_64.tbl |   3 +
+ drivers/char/Kconfig                   |   6 +
+ drivers/char/Makefile                  |   2 +
+ drivers/char/phonebook.c               | 166 +++++++++++++++++++++++++
+ include/linux/syscalls.h               |   5 +
+ include/uapi/asm-generic/unistd.h      |   9 +-
+ include/uapi/linux/phonebook.h         |  41 ++++++
+ kernel/Makefile                        |   2 +
+ kernel/phonebook_syscalls.c            |  46 +++++++
+ kernel/sys_ni.c                        |   4 +
+ 10 files changed, 283 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/char/phonebook.c
+ create mode 100644 include/uapi/linux/phonebook.h
+ create mode 100644 kernel/phonebook_syscalls.c
+
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 5eb708bff..0b3ef5ef7 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -390,6 +390,9 @@
+ 464	common	getxattrat		sys_getxattrat
+ 465	common	listxattrat		sys_listxattrat
+ 466	common	removexattrat		sys_removexattrat
++467 common add_user sys_add_user
++468 common get_user sys_get_user
++469 common del_user sys_del_user
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index 8fb33c904..9901b61b4 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -423,4 +423,10 @@ config ADI
+ 	  and SSM (Silicon Secured Memory).  Intended consumers of this
+ 	  driver include crash and makedumpfile.
+ 
++config PHONEBOOK
++    tristate "Phonebook Character Device"
++    default y
++    help
++      This option enables the Phonebook character device module.
++
+ endmenu
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index e9b360cdc..08a5ca967 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -43,3 +43,5 @@ obj-$(CONFIG_PS3_FLASH)		+= ps3flash.o
+ obj-$(CONFIG_XILLYBUS_CLASS)	+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ obj-$(CONFIG_ADI)		+= adi.o
++
++obj-y += phonebook.o
+diff --git a/drivers/char/phonebook.c b/drivers/char/phonebook.c
+new file mode 100644
+index 000000000..2e3213a32
+--- /dev/null
++++ b/drivers/char/phonebook.c
+@@ -0,0 +1,166 @@
++#include <linux/cdev.h>
++#include <linux/fs.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/phonebook.h>
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Timur Abdullin");
++
++#define DEV_MINOR 0
++#define DEV_CNT 1
++#define CHECK_CMD(buf, cmd) (strncmp((buf), (cmd), sizeof(cmd) - 1) == 0)
++#define BUF_SIZE 256
++#define DEVICE_NAME "phonebook"
++
++struct user_node {
++  struct list_head list;
++  struct user_data data;
++};
++
++static struct class *dev_class;
++static LIST_HEAD(user_list);
++static DEFINE_SPINLOCK(user_lock);
++static int major;
++
++long phone_add_user(struct user_data *input_data) {
++  struct user_node *new_user = kmalloc(sizeof(*new_user), GFP_KERNEL);
++  if (!new_user) return -ENOMEM;
++
++  memcpy(&new_user->data, input_data, sizeof(*input_data));
++  spin_lock(&user_lock);
++  list_add_tail(&new_user->list, &user_list);
++  spin_unlock(&user_lock);
++  return 0;
++}
++EXPORT_SYMBOL(phone_add_user);
++
++long phone_get_user(const char *surname, unsigned int len,
++                    struct user_data *output_data) {
++  struct user_node *node = NULL;
++  char k_surname[PHONEBOOK_MAX_LEN] = {};
++
++  strncpy(k_surname, surname, min(len, PHONEBOOK_MAX_LEN - 1));
++  k_surname[min(len, PHONEBOOK_MAX_LEN - 1)] = '\0';
++
++  spin_lock(&user_lock);
++  list_for_each_entry(node, &user_list, list) {
++    if (strcmp(node->data.surname, k_surname) == 0) {
++      memcpy(output_data, &node->data, sizeof(*output_data));
++      spin_unlock(&user_lock);
++      return 0;
++    }
++  }
++  spin_unlock(&user_lock);
++
++  return -ENOENT;
++}
++EXPORT_SYMBOL(phone_get_user);
++
++long phone_del_user(const char *surname, unsigned int len) {
++  struct user_node *node = NULL;
++  struct user_node *tmp = NULL;
++  char k_surname[PHONEBOOK_MAX_LEN] = {};
++
++  strncpy(k_surname, surname, min(len, PHONEBOOK_MAX_LEN - 1));
++  k_surname[min(len, PHONEBOOK_MAX_LEN - 1)] = '\0';
++
++  spin_lock(&user_lock);
++  list_for_each_entry_safe(node, tmp, &user_list, list) {
++    if (strcmp(node->data.surname, k_surname) == 0) {
++      list_del(&node->list);
++      spin_unlock(&user_lock);
++      kfree(node);
++      return 0;
++    }
++  }
++  spin_unlock(&user_lock);
++
++  return -ENOENT;
++}
++EXPORT_SYMBOL(phone_del_user);
++
++static void add_user_cmd(char *buf) {
++  struct user_data user = {};
++  sscanf(buf, "add %s %s %d %s %s", user.name, user.surname, &user.age,
++         user.phone, user.email);
++  phone_add_user(&user);
++  printk(KERN_INFO "phonebook: User %s was added\n", user.surname);
++}
++
++static void get_user_cmd(char *buf) {
++  char surname[PHONEBOOK_MAX_LEN] = {};
++  struct user_data result = {};
++  sscanf(buf, "get %s", surname);
++  long res = phone_get_user(surname, strlen(surname), &result);
++  if (res == 0) {
++    printk(KERN_INFO "Name: %s\nSurname: %s\nAge: %d\nPhone: %s\nEmail: %s\n",
++           result.name, result.surname, result.age, result.phone, result.email);
++  }
++}
++
++static void del_user_cmd(char *buf) {
++  char surname[PHONEBOOK_MAX_LEN] = {};
++  sscanf(buf, "del %s", surname);
++  long res = phone_del_user(surname, strlen(surname));
++  if (res == 0) {
++    printk(KERN_INFO "phonebook: User %s was deleted\n", surname);
++  } else {
++    printk(KERN_ERR "phonebook: User %s was not deleted\n", surname);
++  }
++}
++
++static ssize_t phonebook_write(struct file *file, const char __user *ubuf,
++                               size_t count, loff_t *ppos) {
++  char buf[BUF_SIZE] = {};
++  size_t len = min(count, BUF_SIZE - 1);
++
++  if (copy_from_user(buf, ubuf, len)) {
++    return -EFAULT;
++  }
++  buf[len] = '\0';
++
++  if (CHECK_CMD(buf, "add")) {
++    add_user_cmd(buf);
++  } else if (CHECK_CMD(buf, "get")) {
++    get_user_cmd(buf);
++  } else if (CHECK_CMD(buf, "del")) {
++    del_user_cmd(buf);
++  } else {
++    printk(KERN_INFO "phonebook: Unknown command\n");
++  }
++
++  return count;
++}
++
++static struct file_operations fops = {
++    .write = phonebook_write,
++};
++
++static int __init phonebook_init(void) {
++  major = register_chrdev(0, DEVICE_NAME, &fops);
++
++  if (major < 0) {
++    return major;
++  }
++
++  dev_class = class_create(DEVICE_NAME);
++  device_create(dev_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
++
++  return 0;
++}
++
++static void __exit phonebook_exit(void) {
++  device_destroy(dev_class, MKDEV(major, 0));
++  class_destroy(dev_class);
++
++  unregister_chrdev(major, DEVICE_NAME);
++
++  printk(KERN_INFO "phonebook module: Unloaded\n");
++}
++
++module_init(phonebook_init);
++module_exit(phonebook_exit);
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index c6333204d..93c45b277 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -78,6 +78,7 @@ struct cachestat;
+ struct statmount;
+ struct mnt_id_req;
+ struct xattr_args;
++struct user_data;
+ 
+ #include <linux/types.h>
+ #include <linux/aio_abi.h>
+@@ -1210,6 +1211,10 @@ asmlinkage long sys_ni_syscall(void);
+ 
+ asmlinkage long sys_ni_posix_timers(void);
+ 
++asmlinkage long sys_get_user(const char __user *surname, unsigned int len, struct user_data __user *output);
++asmlinkage long sys_add_user(struct user_data __user *input);
++asmlinkage long sys_del_user(const char __user *surname, unsigned int len);
++
+ /*
+  * Kernel code should not call syscalls (i.e., sys_xyzyyz()) directly.
+  * Instead, use one of the functions which work equivalently, such as
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 88dc393c2..9f3f408a3 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -850,8 +850,15 @@ __SYSCALL(__NR_listxattrat, sys_listxattrat)
+ #define __NR_removexattrat 466
+ __SYSCALL(__NR_removexattrat, sys_removexattrat)
+ 
++#define __NR_add_user 467
++__SYSCALL(__NR_add_user, sys_add_user)
++#define __NR_get_user 468
++__SYSCALL(__NR_get_user, sys_get_user)
++#define __NR_del_user 469
++__SYSCALL(__NR_del_user, sys_del_user)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 467
++#define __NR_syscalls 470
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/phonebook.h b/include/uapi/linux/phonebook.h
+new file mode 100644
+index 000000000..3df87b1b2
+--- /dev/null
++++ b/include/uapi/linux/phonebook.h
+@@ -0,0 +1,41 @@
++#ifndef _UAPI_LINUX_PHONEBOOK_H
++#define _UAPI_LINUX_PHONEBOOK_H
++
++#include <linux/types.h>
++
++#define PHONEBOOK_MAX_LEN 32u
++
++struct user_data {
++  char name[PHONEBOOK_MAX_LEN];
++  char surname[PHONEBOOK_MAX_LEN];
++  int age;
++  char phone[PHONEBOOK_MAX_LEN];
++  char email[PHONEBOOK_MAX_LEN];
++};
++
++#define PHONEBOOK_IOCTL_BASE 'U'
++#define IOCTL_GET_USER _IOWR(PHONEBOOK_IOCTL_BASE, 0, struct ioctl_get)
++#define IOCTL_ADD_USER _IOW(PHONEBOOK_IOCTL_BASE, 1, struct ioctl_add)
++#define IOCTL_DEL_USER _IOW(PHONEBOOK_IOCTL_BASE, 2, struct ioctl_del)
++
++extern long phone_add_user(struct user_data *input_data);
++extern long phone_get_user(const char *surname, unsigned int len,
++                           struct user_data *output_data);
++extern long phone_del_user(const char *surname, unsigned int len);
++
++struct ioctl_get {
++  char surname[PHONEBOOK_MAX_LEN];
++  unsigned int len;
++  struct user_data data;
++};
++
++struct ioctl_add {
++  struct user_data data;
++};
++
++struct ioctl_del {
++  char surname[PHONEBOOK_MAX_LEN];
++  unsigned int len;
++};
++
++#endif /* _UAPI_LINUX_PHONEBOOK_H */
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 87866b037..d74e7af80 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -12,6 +12,8 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
+ 
++obj-y += phonebook_syscalls.o
++
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ obj-$(CONFIG_VHOST_TASK) += vhost_task.o
+diff --git a/kernel/phonebook_syscalls.c b/kernel/phonebook_syscalls.c
+new file mode 100644
+index 000000000..65bc0da3b
+--- /dev/null
++++ b/kernel/phonebook_syscalls.c
+@@ -0,0 +1,46 @@
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/phonebook.h>
++
++extern long phone_add_user(struct user_data* input_data);
++extern long phone_get_user(const char* surname, unsigned int len,
++                           struct user_data* output_data);
++extern long phone_del_user(const char* surname, unsigned int len);
++
++SYSCALL_DEFINE1(sys_add_user, struct user_data __user*, input_data) {
++  struct user_data kdata = {};
++
++  if (copy_from_user(&kdata, input_data, sizeof(kdata))) return -EFAULT;
++
++  return phone_add_user(&kdata);
++}
++
++SYSCALL_DEFINE3(sys_get_user, const char __user*, surname, unsigned int, len,
++                struct user_data __user*, output_data) {
++  char k_surname[PHONEBOOK_MAX_LEN] = {};
++  struct user_data kdata = {};
++
++  if (copy_from_user(k_surname, surname, min(len, sizeof(k_surname) - 1))) {
++    return -EFAULT;
++  }
++  k_surname[min(len, PHONEBOOK_MAX_LEN)] = '\0';
++
++  int ret = phone_get_user(k_surname, strlen(k_surname), &kdata);
++
++  if (!ret && copy_to_user(output_data, &kdata, sizeof(kdata))) {
++    return -EFAULT;
++  }
++
++  return ret;
++}
++
++SYSCALL_DEFINE2(sys_del_user, const char __user*, surname, unsigned int, len) {
++  char k_surname[PHONEBOOK_MAX_LEN] = {};
++
++  if (copy_from_user(k_surname, surname, min(len, sizeof(k_surname) - 1))) {
++    return -EFAULT;
++  }
++  k_surname[min(len, sizeof(k_surname) - 1)] = '\0';
++
++  return phone_del_user(k_surname, strlen(k_surname));
++}
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index c00a86931..5bff2f548 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -392,3 +392,7 @@ COND_SYSCALL(setuid16);
+ COND_SYSCALL(rseq);
+ 
+ COND_SYSCALL(uretprobe);
++
++COND_SYSCALL(add_user);
++COND_SYSCALL(get_user);
++COND_SYSCALL(del_user);
+-- 
+2.34.1
+
