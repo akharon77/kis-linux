@@ -77,6 +77,26 @@ static void writeval_cmd(char *buf) {
   }
 }
 
+static void readval_cmd(char *buf) {
+  unsigned long addr = 0;
+  unsigned long val = 0;
+  if (sscanf(buf, "readval %lx", &addr) != 1) {
+    printk(KERN_ERR "mmaneg: Invalid format of command\n");
+    return;
+  }
+
+  if (!access_ok((void __user *)addr, sizeof(val))) {
+    printk(KERN_ERR "mmaneg: Invalid address\n");
+    return;
+  }
+
+  if (get_user(val, (unsigned long __user *)addr)) {
+    printk(KERN_ERR "mmaneg: Read operation of address %lx failed\n", addr);
+  } else {
+    printk(KERN_INFO "mmaneg: %lx was readed from address %lx\n", val, addr);
+  }
+}
+
 static ssize_t mmaneg_write(struct file *file, const char __user *ubuf,
                             size_t count, loff_t *ppos) {
   char buf[BUF_SIZE] = {};
@@ -93,6 +113,8 @@ static ssize_t mmaneg_write(struct file *file, const char __user *ubuf,
     findpage_cmd(buf);
   } else if (CHECK_CMD(buf, "writeval")) {
     writeval_cmd(buf);
+  } else if (CHECK_CMD(buf, "readval")) {
+    readval_cmd(buf);
   } else {
     printk(KERN_INFO "mmaneg: Unknown command\n");
   }
